@@ -12,6 +12,11 @@ l'image d'identité rejoue le mouvement extrait par `body3d`, dans la direction 
   fond noir en animation, sur fond blanc en remplacement) est rendu par `fakinflu_nodes` depuis
   `masks.npz` de body3d, sans codec vidéo. Les couleurs restent donc exactes.
 - La vidéo de contrôle (`control_pose.mp4`) arrive du PC (décision 7 du plan) : ni rendu ni suivi ici.
+- **Mémoire** : ComfyUI garde chaque `IMAGE` en float32. `FakinfluSCAILPrep` ne décode que les images
+  retenues, déjà à la taille cible. Chaque morceau est encodé dès son décodage (`FakinfluSaveSegment`),
+  puis assemblé par ffmpeg sans réencodage (`FakinfluConcatVideo`). Le handler refuse le job, avant tout
+  calcul GPU, si le pic estimé (`workflow.ram_bytes`) dépasse `SCAIL_IMAGES_RAM_SHARE` (30 %) de la limite
+  du conteneur.
 - Poids bakés, commits Hugging Face épinglés et sha256 vérifiés (`download_models.sh`) :
   - `core` : LoRA, umT5 fp8, CLIP vision, VAE, ~10,2 Go ;
   - `fp16` : 32,8 Go, par défaut (`WITH_FP16=1`) ;

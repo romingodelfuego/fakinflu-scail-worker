@@ -7,14 +7,14 @@ noeuds identiques dans 0.34.0), avec deux ecarts voulus :
     pose est rendu par FakinfluSCAILPrep depuis masks.npz, deja produit par body3d (meme suivi).
   - la video de pose est la video de controle de body3d (rendu `scail`), pas la video source.
 
-  control.mp4 -> composantes -> FakinfluSCAILPrep (cadence cible, taille, masque colore depuis masks.npz)
+  control.mp4 + masks.npz -> FakinfluSCAILPrep (decode SEULEMENT les images retenues, deja a la taille cible)
   ref.png -> reference + CLIP vision ; ref_mask.png (option) -> FakinfluSCAILRefMask
   Wan 2.1 14B SCAIL-2 -> LoRA DPO -> LoRA lightx2v (distillation 6 etapes, cfg 1) -> ModelSamplingSD3
   morceau k : images [k*(L-P), +L) -> WanSCAILToVideo (previous_frames = morceau k-1) -> SamplerCustom
-              -> VAEDecode -> on retire les P premieres images (recouvrement) -> concatenation
-  -> CreateVideo -> SaveVideo
+              -> VAEDecode -> FakinfluSaveSegment (H.264 des le decodage, recouvrement retire)
+  -> FakinfluConcatVideo (ffmpeg concat, sans reencodage) : aucune concatenation de tenseurs en RAM
 """
-import json, sys
+import json, os, sys
 
 OUTPUT_FILES = {"video": "animation_*.mp4"}
 OUTPUT_NAMES = {"video": "animation.mp4"}
@@ -73,7 +73,7 @@ def size_for(src_w, src_h, short):
 
 def build_workflow(params, prompt, negative, files, prefix, meta):
     """params : preset d'animation resolu (app/src/schemas AnimatePreset) ; prompt / negative : DA.
-    files : noms dans input/ de ComfyUI {control, ref, ref_mask?} et chemin absolu {masks}.
+    files : chemins absolus {control, masks} (lus par FakinfluSCAILPrep) et noms dans input/ {ref, ref_mask?}.
     meta : {width, height, fps, frames} de la video de controle."""
     p = params or {}
     mode = p.get("mode", "animation")
@@ -93,10 +93,9 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
     segs = segments(n)
 
     wf = {
-        "load": {"class_type": "LoadVideo", "_meta": {"title": "lecture controle"}, "inputs": {"file": files["control"]}},
-        "video": {"class_type": "GetVideoComponents", "inputs": {"video": ["load", 0]}},
         "prep": {"class_type": "FakinfluSCAILPrep", "_meta": {"title": "pose + masque (masks.npz)"},
-                 "inputs": {"images": ["video", 0], "masks_path": files["masks"], "src_fps": float(meta["fps"]),
+                 "inputs": {"video_path": files["control"], "masks_path": files["masks"],
+                            "src_frames": int(meta["frames"]), "src_fps": float(meta["fps"]),
                             "fps": fps, "width": width, "height": height, "replacement_mode": replacement}},
         "ref": {"class_type": "LoadImage", "_meta": {"title": "image d'identite"}, "inputs": {"image": files["ref"]}},
         # --- modeles
@@ -133,7 +132,7 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
                           "inputs": {"image": ["ref_mask_img", 0], "replacement_mode": replacement}}
         ref_mask = ["ref_mask", 0]
 
-    acc, prev = None, None
+    saved, prev = None, None
     for k, (start, length) in enumerate(segs):
         s = f"s{k}"
         wf[f"{s}_pose"] = {"class_type": "ImageFromBatch", "inputs": {"image": ["prep", 0], "batch_index": start, "length": length}}
@@ -156,16 +155,14 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
         wf[f"{s}_dec"] = {"class_type": "VAEDecode", "_meta": {"title": f"decodage {k + 1}/{len(segs)}"},
                           "inputs": {"samples": [f"{s}_sample", 1], "vae": ["vae", 0]}}
         prev = [f"{s}_dec", 0]
-        if acc is None:
-            acc = prev
-        else:
-            wf[f"{s}_trim"] = {"class_type": "ImageFromBatch", "inputs": {"image": prev, "batch_index": OVERLAP, "length": 4096}}
-            wf[f"{s}_cat"] = {"class_type": "ImageBatch", "inputs": {"image1": acc, "image2": [f"{s}_trim", 0]}}
-            acc = [f"{s}_cat", 0]
+        save = {"images": prev, "filename_prefix": prefix, "index": k, "skip": OVERLAP if k else 0, "fps": fps}
+        if saved:
+            save["previous"] = saved
+        wf[f"{s}_save"] = {"class_type": "FakinfluSaveSegment", "_meta": {"title": f"encodage {k + 1}/{len(segs)}"}, "inputs": save}
+        saved = [f"{s}_save", 0]
 
-    wf["out"] = {"class_type": "CreateVideo", "inputs": {"images": acc, "fps": fps}}
-    wf["save"] = {"class_type": "SaveVideo", "_meta": {"title": "enregistrement"},
-                  "inputs": {"video": ["out", 0], "filename_prefix": f"{prefix}/animation", "format": "auto", "format.codec": "auto"}}
+    wf["save"] = {"class_type": "FakinfluConcatVideo", "_meta": {"title": "assemblage"},
+                  "inputs": {"segments": saved, "filename_prefix": prefix}}
     return wf
 
 
@@ -179,13 +176,21 @@ def plan(params, meta):
     return {"width": w, "height": h, "fps": fps, "frames_in": n, "segments": len(segs), "frames_out": output_frames(segs)}
 
 
+def ram_bytes(plan_):
+    """Pic de RAM des IMAGE gardees par ComfyUI (float32 RGB) : pose + masque (frames_in chacun) et les
+    morceaux decodes, en cache jusqu'a la fin du graphe (~frames_out + recouvrements). Hors poids du modele."""
+    per_frame = plan_["width"] * plan_["height"] * 3 * 4
+    return per_frame * (2 * plan_["frames_in"] + plan_["frames_out"] + OVERLAP * plan_["segments"])
+
+
 def _validate(url, preset_path, masks_path):
     """Soumet le graphe a un ComfyUI (local, 0 credit) : il le valide avant toute execution.
-    input/ doit contenir control.mp4 et ref.png ; les modeles peuvent etre des fichiers vides."""
+    control_pose.mp4 a cote de masks.npz ; input/ doit contenir ref.png ; modeles en fichiers vides."""
     import urllib.error, urllib.request
     preset = json.load(open(preset_path))
     meta = {"width": 632, "height": 1280, "fps": 30.0, "frames": 554}
-    wf = build_workflow(preset, "validation", "", {"control": "control.mp4", "ref": "ref.png", "masks": masks_path},
+    control = os.path.join(os.path.dirname(os.path.abspath(masks_path)), "control_pose.mp4")
+    wf = build_workflow(preset, "validation", "", {"control": control, "ref": "ref.png", "masks": masks_path},
                         "fakinflu/validate", meta)
     post = lambda path, body: urllib.request.urlopen(urllib.request.Request(
         url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=30)
@@ -206,5 +211,5 @@ if __name__ == "__main__":
     params = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else {}
     meta = {"width": 632, "height": 1280, "fps": 30.0, "frames": 554}
     print(json.dumps(plan(params, meta)))
-    print(json.dumps(build_workflow(params, "prompt", "", {"control": "control.mp4", "ref": "ref.png", "masks": "/tmp/masks.npz"},
+    print(json.dumps(build_workflow(params, "prompt", "", {"control": "/tmp/control.mp4", "ref": "ref.png", "masks": "/tmp/masks.npz"},
                                     "fakinflu/run", meta), indent=1))

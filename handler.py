@@ -18,16 +18,20 @@ Entree (contrat transfer.py) :
 
 La video de controle arrive du PC (decision 7 du plan) : le worker ne refait ni le rendu ni le suivi.
 """
-import glob, json, os, queue, shutil, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
+import glob, json, os, queue, re, shutil, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
 
 import runpod
 
 from transfer import Outputs, fetch_inputs, preview_event, version_event
-from workflow import build_workflow, plan, OUTPUT_FILES, OUTPUT_NAMES
+from workflow import build_workflow, plan, ram_bytes, OUTPUT_FILES, OUTPUT_NAMES
 
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 COMFY_DIR = os.environ.get("COMFY_DIR", "/comfyui")
 JOB_TIMEOUT = int(os.environ.get("SCAIL_JOB_TIMEOUT_S", "3500"))
+# Images gardees en RAM par ComfyUI (pose, masque, morceaux decodes, float32) : elles ne doivent pas depasser
+# cette part de la limite memoire du conteneur, le reste allant aux poids (offload) et a PyTorch.
+IMAGES_RAM_SHARE = float(os.environ.get("SCAIL_IMAGES_RAM_SHARE", "0.30"))
+IMAGES_RAM_FALLBACK_GB = float(os.environ.get("SCAIL_IMAGES_RAM_GB", "12"))  # si la limite est illisible
 
 
 def _http(method, path, payload=None, timeout=30):
@@ -108,7 +112,14 @@ def run_workflow(wf):
             if time.time() - last_poll < 2:
                 continue
             last_poll = time.time()
-            h = _http("GET", f"/history/{pid}")
+            try:
+                h = _http("GET", f"/history/{pid}")
+            except urllib.error.HTTPError:
+                raise
+            except urllib.error.URLError as e:
+                # processus ComfyUI tue (le plus souvent : limite memoire du conteneur atteinte)
+                raise RuntimeError(f"ComfyUI s'est arrete en cours de calcul ({e.reason}) : memoire du conteneur "
+                                   "probablement depassee (journaux RunPod : « OOM »)") from e
             if pid not in h:
                 continue
             st = h[pid].get("status") or {}
@@ -154,6 +165,55 @@ def thumb(video, t=1.0):
         return f.read()
 
 
+def memory_limit_bytes():
+    """Limite memoire du conteneur (cgroup v2 puis v1) ; None si absente ou illisible. (= body3d)"""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+        except OSError:
+            continue
+        if v.isdigit() and int(v) < 1 << 60:  # « max » ou valeur geante = pas de limite
+            return int(v)
+    return None
+
+
+def check_memory(summary):
+    """Refuse AVANT tout calcul GPU un job dont les images feraient sauter le conteneur."""
+    need = ram_bytes(summary)
+    limit = memory_limit_bytes()
+    budget = IMAGES_RAM_SHARE * limit if limit else IMAGES_RAM_FALLBACK_GB * 1024 ** 3
+    gb = lambda b: f"{b / 1024 ** 3:.1f} Go"
+    info = f"images en RAM {gb(need)}, limite conteneur {gb(limit) if limit else 'inconnue'}, budget {gb(budget)}"
+    if need > budget:
+        raise ValueError(f"animation trop lourde pour le worker ({info}) : baisser resolution ou fps du preset")
+    return info
+
+
+GEN = re.compile(r"^generation (\d+)/(\d+)$")
+
+
+def global_progress(events):
+    """Le pourcentage de SamplerCustom repart de 0 a chaque morceau : on le ramene a l'ensemble du job
+    (5 % -> 95 %, le reste pour la preparation et l'assemblage)."""
+    for ev in events:
+        m = GEN.match(ev.get("step", "")) if ev.get("type") == "progress" else None
+        if m and "pct" in ev:
+            k, n = int(m.group(1)), int(m.group(2))
+            ev = {**ev, "pct": round(5 + 90 * ((k - 1) + ev["pct"] / 100) / n)}
+        yield ev
+
+
+def global_progress_wrap(gen):
+    """yield from conserve la valeur de retour (secondes) de run_workflow."""
+    while True:
+        try:
+            ev = next(gen)
+        except StopIteration as stop:
+            return stop.value
+        yield from global_progress([ev])
+
+
 def _to_input(path, tag):
     """Copie une entree dans input/ de ComfyUI (LoadVideo / LoadImage n'y lisent que la)."""
     name = f"{tag}_{os.path.basename(path)}"
@@ -183,18 +243,19 @@ def handler(job):
             raise ValueError("prompt vide : SCAIL-2 a besoin de la description de la DA")
         meta = ffprobe(paths["control"])
         summary = plan(preset, meta)
+        yield {"type": "progress", "step": check_memory(summary), "pct": 1}
         yield {"type": "progress", "pct": 2,
                "step": f"controle {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
                        f"{summary['width']}x{summary['height']} a {summary['fps']:g} fps, "
                        f"{summary['segments']} morceau(x), {summary['frames_out']} images"}
 
-        files = {"control": _to_input(paths["control"], tag), "ref": _to_input(paths["ref"], tag), "masks": paths["masks"]}
+        files = {"control": paths["control"], "masks": paths["masks"], "ref": _to_input(paths["ref"], tag)}
         if "ref_mask" in paths:
             files["ref_mask"] = _to_input(paths["ref_mask"], tag)
-        copied = [os.path.join(COMFY_DIR, "input", files[k]) for k in ("control", "ref", "ref_mask") if k in files]
+        copied = [os.path.join(COMFY_DIR, "input", files[k]) for k in ("ref", "ref_mask") if k in files]
         wait_comfy()
         wf = build_workflow(preset, prompt, negative, files, prefix, meta)
-        seconds = yield from run_workflow(wf)
+        seconds = yield from global_progress_wrap(run_workflow(wf))
 
         produced = collect(prefix)
         if "video" not in produced:
