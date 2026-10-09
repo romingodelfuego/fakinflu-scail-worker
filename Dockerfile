@@ -12,12 +12,21 @@ RUN grep -q '"WanSCAILToVideo"' /comfyui/comfy_extras/nodes_scail.py \
  && grep -q 'pose_video_mask' /comfyui/comfy_extras/nodes_scail.py \
  && grep -q '"SamplerCustom"' /comfyui/comfy_extras/nodes_custom_sampler.py
 
+# ComfyUI dimensionne sa memoire epinglee sur la RAM de l'HOTE (psutil : 503 Go sur un A40 RunPod -> 464 Go
+# epinglables), pas sur la limite du conteneur : en chargeant les 31 Go du modele, le noyau tue ComfyUI sans
+# trace (job du 2026-10-09). start.sh de worker-comfyui n'a aucun point d'entree pour des options : on y
+# ajoute ${COMFY_EXTRA_ARGS} (defaut ci-dessous, modifiable dans l'env de l'endpoint sans rebuild).
+RUN sed -i 's#--log-stdout &#--log-stdout ${COMFY_EXTRA_ARGS} \&#' /start.sh \
+ && test "$(grep -c 'COMFY_EXTRA_ARGS} &' /start.sh)" -ge 1
+ENV COMFY_EXTRA_ARGS="--disable-pinned-memory"
+
 RUN apt-get update && apt-get install -y --no-install-recommends aria2 \
  && rm -rf /var/lib/apt/lists/*
 
-# --- Poids BAKES : core ~10,2 Go + fp16 32,8 Go (WITH_FP16) et/ou int8 16,7 Go (WITH_INT8) ---------
+# --- Poids BAKES : core ~10,2 Go + fp16 32,8 Go (WITH_FP16) + int8 16,7 Go (WITH_INT8) = ~60 Go --------
+# Les deux par defaut : le preset choisit sans rebuild (int8 = modele resident en VRAM sur 48 Go).
 ARG WITH_FP16=1
-ARG WITH_INT8=0
+ARG WITH_INT8=1
 COPY download_models.sh /tmp/download_models.sh
 RUN MODELS_DIR=/comfyui/models bash /tmp/download_models.sh core
 RUN if [ "${WITH_FP16}" = "1" ]; then MODELS_DIR=/comfyui/models bash /tmp/download_models.sh fp16; fi

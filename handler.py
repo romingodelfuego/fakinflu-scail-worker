@@ -118,8 +118,7 @@ def run_workflow(wf):
                 raise
             except urllib.error.URLError as e:
                 # processus ComfyUI tue (le plus souvent : limite memoire du conteneur atteinte)
-                raise RuntimeError(f"ComfyUI s'est arrete en cours de calcul ({e.reason}) : memoire du conteneur "
-                                   "probablement depassee (journaux RunPod : « OOM »)") from e
+                raise RuntimeError(f"ComfyUI s'est arrete en cours de calcul ({e.reason}) : {oom_report()}") from e
             if pid not in h:
                 continue
             st = h[pid].get("status") or {}
@@ -178,6 +177,85 @@ def memory_limit_bytes():
     return None
 
 
+def _cgroup(name):
+    for base in ("/sys/fs/cgroup", "/sys/fs/cgroup/memory"):
+        try:
+            with open(os.path.join(base, name)) as f:
+                return f.read()
+        except OSError:
+            continue
+    return None
+
+
+def oom_report():
+    """Pourquoi ComfyUI a disparu : le compteur oom_kill du cgroup tranche (sinon : plantage natif, CUDA...)."""
+    events = _cgroup("memory.events") or ""
+    kills = next((int(l.split()[1]) for l in events.splitlines() if l.startswith("oom_kill ")), None)
+    peak = _cgroup("memory.peak") or _cgroup("memory.max_usage_in_bytes")
+    limit = memory_limit_bytes()
+    gb = lambda b: f"{int(b) / 1024 ** 3:.1f} Go"
+    mem = f"pic {gb(peak.strip())}" if peak and peak.strip().isdigit() else "pic inconnu"
+    mem += f", limite {gb(limit)}" if limit else ", limite inconnue"
+    if kills:
+        return (f"tue par le noyau faute de memoire (oom_kill={kills}, {mem}). Verifier COMFY_EXTRA_ARGS "
+                f"(actuel : {os.environ.get('COMFY_EXTRA_ARGS', '')!r}), sinon preset int8 ou resolution plus basse")
+    return f"aucun oom_kill dans le cgroup ({mem}) : plantage natif probable (journaux RunPod du worker)"
+
+
+def _gb(b):
+    return round(int(b) / 1024 ** 3, 2) if b not in (None, "") and str(b).strip().isdigit() else None
+
+
+def probe_report():
+    """Sonde (params.probe) : ce que voit le conteneur et ce que voit ComfyUI, SANS charger de modele.
+    Sert a choisir COMFY_EXTRA_ARGS / la precision avant de payer un vrai job (README, arbre de decision)."""
+    events = _cgroup("memory.events") or ""
+    stats = {}
+    try:
+        stats = _http("GET", "/system_stats", timeout=10)
+    except Exception as e:  # ComfyUI pas encore pret : la sonde repond quand meme
+        stats = {"error": f"{type(e).__name__}: {e}"}
+    disk = {}
+    for path in ("/", COMFY_DIR):
+        try:
+            st = os.statvfs(path)
+            disk[path] = {"free_gb": round(st.f_bavail * st.f_frsize / 1024 ** 3, 2), "total_gb": round(st.f_blocks * st.f_frsize / 1024 ** 3, 2)}
+        except OSError:
+            pass
+    system = stats.get("system") or {}
+    ram_seen = system.get("ram_total")
+    return {
+        "cgroup": {"limit_gb": _gb(memory_limit_bytes()), "current_gb": _gb((_cgroup("memory.current") or "").strip()),
+                   "peak_gb": _gb((_cgroup("memory.peak") or _cgroup("memory.max_usage_in_bytes") or "").strip()),
+                   "events": dict(l.split() for l in events.splitlines() if len(l.split()) == 2)},
+        "comfyui": {"version": system.get("comfyui_version"), "pytorch": system.get("pytorch_version"),
+                    "argv": system.get("argv"), "ram_total_gb": _gb(ram_seen),
+                    # meme formule que comfy/model_management.py (0.34.0), avec la RAM que ComfyUI croit avoir
+                    "max_pinned_gb_estime": round(max(0.4 * ram_seen, min(0.9 * ram_seen, ram_seen - 4 * 1024 ** 3)) / 1024 ** 3, 1)
+                    if ram_seen and "--disable-pinned-memory" not in (system.get("argv") or []) else 0,
+                    "devices": [{k: d.get(k) for k in ("name", "type", "vram_total", "vram_free")} for d in stats.get("devices") or []],
+                    "error": stats.get("error")},
+        "disk": disk,
+        "env": {"COMFY_EXTRA_ARGS": os.environ.get("COMFY_EXTRA_ARGS", "")},
+    }
+
+
+# fp16 : 31 Go de poids + ~8 Go d'encodeurs + activations -> ne tient pas resident sous 48 Go
+FP16_MIN_VRAM_GB = float(os.environ.get("SCAIL_FP16_MIN_VRAM_GB", "44"))
+
+
+def check_vram(preset):
+    """Refuse fp16 sur une carte trop petite AVANT de charger 31 Go (le plantage arriverait apres)."""
+    try:
+        devices = _http("GET", "/system_stats", timeout=10).get("devices") or []
+    except Exception:
+        return None
+    vram = max((d.get("vram_total") or 0 for d in devices), default=0) / 1024 ** 3
+    if preset.get("precision", "fp16") == "fp16" and 0 < vram < FP16_MIN_VRAM_GB:
+        raise ValueError(f"precision fp16 sur {vram:.0f} Go de VRAM : il en faut {FP16_MIN_VRAM_GB:g} ; utiliser le preset int8")
+    return f"VRAM {vram:.0f} Go, precision {preset.get('precision', 'fp16')}"
+
+
 def check_memory(summary):
     """Refuse AVANT tout calcul GPU un job dont les images feraient sauter le conteneur."""
     need = ram_bytes(summary)
@@ -232,6 +310,23 @@ def handler(job):
     prefix = f"fakinflu/{inp.get('run_id') or job.get('id', 'run')}"
     t0 = time.time()
     yield version_event("scail")  # toujours en premier : le client verifie la version de l'image
+    if params.get("probe"):
+        try:
+            outputs = Outputs(inp)
+            wait_comfy(120)
+            report = probe_report()
+            print(f"[scail] sonde : {json.dumps(report)}", flush=True)
+            path = os.path.join(work, "probe.json")
+            with open(path, "w") as f:
+                json.dump(report, f, indent=2)
+            yield from outputs.emit("probe", path, "probe.json")
+            yield {"type": "done", "seed": None, "timings": {"total_s": round(time.time() - t0, 1)}}
+        except Exception as e:
+            traceback.print_exc()
+            yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return
     try:
         outputs = Outputs(inp)
         paths, events = fetch_inputs(inp, os.path.join(work, "in"), outputs)
@@ -243,7 +338,9 @@ def handler(job):
             raise ValueError("prompt vide : SCAIL-2 a besoin de la description de la DA")
         meta = ffprobe(paths["control"])
         summary = plan(preset, meta)
-        yield {"type": "progress", "step": check_memory(summary), "pct": 1}
+        mem_info = check_memory(summary)
+        print(f"[scail] {mem_info} ; COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '')!r}", flush=True)
+        yield {"type": "progress", "step": mem_info, "pct": 1}
         yield {"type": "progress", "pct": 2,
                "step": f"controle {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
                        f"{summary['width']}x{summary['height']} a {summary['fps']:g} fps, "
@@ -254,6 +351,9 @@ def handler(job):
             files["ref_mask"] = _to_input(paths["ref_mask"], tag)
         copied = [os.path.join(COMFY_DIR, "input", files[k]) for k in ("ref", "ref_mask") if k in files]
         wait_comfy()
+        vram_info = check_vram(preset)
+        if vram_info:
+            yield {"type": "progress", "step": vram_info, "pct": 3}
         wf = build_workflow(preset, prompt, negative, files, prefix, meta)
         seconds = yield from global_progress_wrap(run_workflow(wf))
 
