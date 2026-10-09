@@ -17,33 +17,6 @@ l'image d'identité rejoue le mouvement extrait par `body3d`, dans la direction 
   puis assemblé par ffmpeg sans réencodage (`FakinfluConcatVideo`). Le handler refuse le job, avant tout
   calcul GPU, si le pic estimé (`workflow.ram_bytes`) dépasse `SCAIL_IMAGES_RAM_SHARE` (30 %) de la limite
   du conteneur.
-- **Mémoire épinglée** : ComfyUI 0.34.0 la dimensionne sur la RAM de l'hôte, pas sur celle du conteneur,
-  et le noyau le tue au chargement des 31 Go du modèle. Le Dockerfile ajoute `${COMFY_EXTRA_ARGS}` au
-  `start.sh` de worker-comfyui, avec `--disable-pinned-memory` par défaut (modifiable dans l'env de l'endpoint).
-
-## Si ComfyUI meurt : mesurer, puis régler sans rebuild
-
-1. `make animate-probe` : sonde sans aucun modèle chargé (≈ 0,05 $). Elle rapporte :
-   - la limite mémoire du conteneur et le compteur `oom_kill` ;
-   - la RAM vue par ComfyUI et la mémoire épinglée qu'il s'autorise ;
-   - la VRAM, le disque libre et les options ComfyUI réellement appliquées (`argv`).
-2. Choisir le réglage dans l'env de l'endpoint (`COMFY_EXTRA_ARGS`) ou dans le preset :
-
-| Ce que disent la sonde ou le message d'erreur (`oom_report`) | Réglage |
-|---|---|
-| `oom_kill` > 0 (le noyau a tué ComfyUI) | `--disable-pinned-memory` (défaut) ; si ça ne suffit pas : `--disable-pinned-memory --fast-disk --cache-none` |
-| `oom_kill` = 0 (plantage natif, p. ex. comfy-aimdo / DynamicVRAM) | `--disable-dynamic-vram` |
-| les deux, ou GPU 24 Go | preset `int8` : 16,7 Go, tout reste en VRAM sur 48 Go |
-
-Garde-fou : le handler refuse `fp16` sous 44 Go de VRAM (`SCAIL_FP16_MIN_VRAM_GB`), avant de charger
-quoi que ce soit.
-
-## Moteurs alternatifs (porte n°2)
-
-- **Kling v2.6 Motion Control** : endpoint public RunPod, environ 0,42 $ le clip, rien à déployer. C'est le
-  témoin de qualité à mettre à côté de SCAIL-2.
-- **Wan-Animate-2** (Apache-2.0) : `WanAnimate2ToVideo` est natif dans ComfyUI 0.34.0, donc dans cette
-  image. Il lit directement la vidéo pilote, sans masque. C'est le plan B si SCAIL-2 déçoit.
 - Poids bakés, commits Hugging Face épinglés et sha256 vérifiés (`download_models.sh`) :
   - `core` : LoRA, umT5 fp8, CLIP vision, VAE, ~10,2 Go ;
   - `fp16` : 32,8 Go, par défaut (`WITH_FP16=1`) ;
