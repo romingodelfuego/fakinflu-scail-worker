@@ -14,7 +14,11 @@ Memoire (OOM mesure sur body3d le 2026-10-09 : ComfyUI garde chaque IMAGE en flo
   - FakinfluSaveSegment encode chaque morceau en H.264 des qu'il est decode, FakinfluConcatVideo les
     assemble sans reencodage : plus de concatenation de tenseurs (ImageBatch) ni de CreateVideo.
 
-  FakinfluSCAILPrep     control.mp4 + masks.npz -> (pose, masque colore) a la cadence et a la taille cibles
+  FakinfluSCAILPrep     video source + masks.npz -> (pose_video, masque colore) a la cadence et a la taille cibles
+                        (character replacement : pose_video = la video source brute, comme le blueprint officiel ;
+                        masks.npz peut etre a une autre cadence que la video, alignement sur le temps)
+  FakinfluInputsSheet   planche « vu par le modele » : pose_video et masque a la taille ou le modele les lit,
+                        reference recadree comme WanSCAILToVideo, masque de reference
   FakinfluSCAILRefMask  image noir et blanc (blanc = personne) -> masque colore de la reference
   FakinfluSaveSegment   morceau decode -> segment_<k>.mp4 (recouvrement retire), liste chainee des segments
   FakinfluConcatVideo   segments -> animation.mp4 (ffmpeg concat, copie de flux)
@@ -85,6 +89,8 @@ class FakinfluSCAILPrep:
             "width": ("INT", {"default": 512, "min": 32, "max": 4096, "step": 32}),
             "height": ("INT", {"default": 1024, "min": 32, "max": 4096, "step": 32}),
             "replacement_mode": ("BOOLEAN", {"default": False}),
+        }, "optional": {
+            "masks_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0}),
         }}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "INT")
@@ -92,11 +98,19 @@ class FakinfluSCAILPrep:
     FUNCTION = "run"
     CATEGORY = "fakinflu"
 
-    def run(self, video_path, masks_path, src_frames, src_fps, fps, width, height, replacement_mode):
+    def run(self, video_path, masks_path, src_frames, src_fps, fps, width, height, replacement_mode, masks_fps=0.0):
         masks = load_masks(masks_path)
-        if abs(src_frames - masks.shape[0]) > 1:
-            raise ValueError(f"controle ({src_frames} images) et masks.npz ({masks.shape[0]}) ne viennent pas du meme run")
-        idx = frame_indices(min(src_frames, masks.shape[0]), src_fps, fps)
+        if masks_fps:  # masques a leur propre cadence (body3d : 30 i/s sur une source a 59,94) : image la plus proche
+            dur_v, dur_m = src_frames / src_fps, masks.shape[0] / masks_fps
+            if abs(dur_v - dur_m) > max(0.25, 0.02 * dur_v):
+                raise ValueError(f"video ({dur_v:.2f} s) et masks.npz ({dur_m:.2f} s) n'ont pas la meme duree")
+            idx = frame_indices(src_frames, src_fps, fps)
+            to_mask = {i: min(masks.shape[0] - 1, int(round(i / src_fps * masks_fps))) for i in idx}
+        else:
+            if abs(src_frames - masks.shape[0]) > 1:
+                raise ValueError(f"video ({src_frames} images) et masks.npz ({masks.shape[0]}) ne viennent pas du meme run")
+            idx = frame_indices(min(src_frames, masks.shape[0]), src_fps, fps)
+            to_mask = {i: i for i in idx}
         dev, dt = comfy.model_management.intermediate_device(), comfy.model_management.intermediate_dtype()
         pose = torch.empty((len(idx), height, width, 3), dtype=dt, device=dev)
         mask = torch.empty((len(idx), height, width, 3), dtype=dt, device=dev)
@@ -109,7 +123,7 @@ class FakinfluSCAILPrep:
             ks = [pos[i] for i, _ in buf]
             frames = torch.from_numpy(np.stack([f for _, f in buf])).to(device=dev, dtype=dt) / 255.0
             pose[ks[0]:ks[-1] + 1] = _fit(frames, width, height, "area")
-            colored = torch.from_numpy(colorize(masks[[i for i, _ in buf]], bg)).to(device=dev, dtype=dt)
+            colored = torch.from_numpy(colorize(masks[[to_mask[i] for i, _ in buf]], bg)).to(device=dev, dtype=dt)
             mask[ks[0]:ks[-1] + 1] = _fit(colored, width, height, "nearest-exact")
             buf.clear()
 
@@ -210,9 +224,76 @@ class FakinfluConcatVideo:
         return {"ui": {"text": [out]}}
 
 
+SHEET_COLS = 6  # instants montres sur la planche
+
+
+def _u8(images):
+    return (images[..., :3].clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+
+
+def sheet_rows(pose, mask, ref, width, height, ref_mask=None, cols=SHEET_COLS):
+    """Lignes de la planche, telles que WanSCAILToVideo les lit : pose et masque a width/2 x height/2
+    (recadrage centre, 'area'), reference recadree a width x height ('bicubic' ~ 'area' ici)."""
+    n = pose.shape[0]
+    pick = sorted({int(round(k * (n - 1) / max(1, cols - 1))) for k in range(cols)})
+    half = (width // 2, height // 2)
+    rows = [("pose_video (source)", _u8(_fit(pose[pick], *half, "area")), pick),
+            ("pose_video_mask", _u8(_fit(mask[pick], *half, "nearest-exact")), pick)]
+    refs = [_u8(_fit(ref[:1], width, height, "area"))[0]]
+    if ref_mask is not None:
+        refs.append(_u8(_fit(ref_mask[:1], width, height, "nearest-exact"))[0])
+    rows.append(("reference_image" + (" + mask" if ref_mask is not None else ""), np.stack(refs), None))
+    return rows
+
+
+def render_sheet(rows, path, title):
+    from PIL import Image, ImageDraw
+    pad, label_h = 8, 22
+    widths = [sum(im.shape[1] + pad for im in imgs) for _, imgs, _ in rows]
+    heights = [imgs.shape[1] + label_h + pad for _, imgs, _ in rows]
+    sheet = Image.new("RGB", (max(widths) + pad, sum(heights) + label_h + pad), (245, 245, 242))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((pad, 4), title, fill=(20, 20, 20))
+    y = label_h + pad
+    for (label, imgs, pick), h in zip(rows, heights):
+        draw.text((pad, y), label if pick is None else f"{label}  images {pick}", fill=(20, 20, 20))
+        x = pad
+        for im in imgs:
+            sheet.paste(Image.fromarray(im), (x, y + label_h))
+            x += im.shape[1] + pad
+        y += h
+    sheet.save(path, optimize=True)
+
+
+class FakinfluInputsSheet:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "pose_video": ("IMAGE",), "pose_video_mask": ("IMAGE",), "reference_image": ("IMAGE",),
+            "width": ("INT", {"default": 512, "min": 32, "max": 4096, "step": 32}),
+            "height": ("INT", {"default": 1024, "min": 32, "max": 4096, "step": 32}),
+            "title": ("STRING", {"default": ""}),
+            "filename_prefix": ("STRING", {"default": "fakinflu/animation"}),
+        }, "optional": {"reference_image_mask": ("IMAGE",)}}
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = "fakinflu"
+
+    def run(self, pose_video, pose_video_mask, reference_image, width, height, title, filename_prefix,
+            reference_image_mask=None):
+        path = os.path.join(_out_dir(filename_prefix), "inputs_sheet_00001_.png")
+        render_sheet(sheet_rows(pose_video, pose_video_mask, reference_image, width, height, reference_image_mask),
+                     path, title)
+        return {"ui": {"text": [path]}}
+
+
 NODE_CLASS_MAPPINGS = {"FakinfluSCAILPrep": FakinfluSCAILPrep, "FakinfluSCAILRefMask": FakinfluSCAILRefMask,
-                       "FakinfluSaveSegment": FakinfluSaveSegment, "FakinfluConcatVideo": FakinfluConcatVideo}
+                       "FakinfluSaveSegment": FakinfluSaveSegment, "FakinfluConcatVideo": FakinfluConcatVideo,
+                       "FakinfluInputsSheet": FakinfluInputsSheet}
 NODE_DISPLAY_NAME_MAPPINGS = {"FakinfluSCAILPrep": "fakinflu SCAIL-2 : pose + masque (masks.npz)",
                               "FakinfluSCAILRefMask": "fakinflu SCAIL-2 : masque de la reference",
                               "FakinfluSaveSegment": "fakinflu SCAIL-2 : encodage d'un morceau",
-                              "FakinfluConcatVideo": "fakinflu SCAIL-2 : assemblage de la video"}
+                              "FakinfluConcatVideo": "fakinflu SCAIL-2 : assemblage de la video",
+                              "FakinfluInputsSheet": "fakinflu SCAIL-2 : planche des entrees (vu par le modele)"}

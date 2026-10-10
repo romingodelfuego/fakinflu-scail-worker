@@ -11,7 +11,8 @@ l'image d'identité rejoue le mouvement extrait par `body3d`, dans la direction 
 - **Pas de suivi SAM 3.1 ici** (décision du 2026-10-09) : le masque coloré que SCAIL-2 attend (bleu pur sur
   fond noir en animation, sur fond blanc en remplacement) est rendu par `fakinflu_nodes` depuis
   `masks.npz` de body3d, sans codec vidéo. Les couleurs restent donc exactes.
-- La vidéo de contrôle (`control_pose.mp4`) arrive du PC (décision 7 du plan) : ni rendu ni suivi ici.
+- Character replacement : `pose_video` = la **vidéo source** brute, comme le blueprint officiel (SCAIL-2 n'attend pas de carte de pose). Pas de suivi ici : le masque vient de `masks.npz` (body3d), aligné sur le temps (`preset.masks_fps`).
+- Chaque job produit `inputs_sheet.png` : la planche « vu par le modèle » (pose_video et masque à la taille où le modèle les lit, référence recadrée, masque de référence).
 - **Mémoire** : ComfyUI garde chaque `IMAGE` en float32. `FakinfluSCAILPrep` ne décode que les images
   retenues, déjà à la taille cible. Chaque morceau est encodé dès son décodage (`FakinfluSaveSegment`),
   puis assemblé par ffmpeg sans réencodage (`FakinfluConcatVideo`). Le handler refuse le job, avant tout
@@ -51,8 +52,8 @@ quoi que ce soit.
 
 | Entrée | Fichier client |
 |---|---|
-| `control` | `data/work/<id>/motion/control_pose.mp4` |
-| `masks` | `data/work/<id>/motion/masks.npz` (même run que `control`) |
+| `source` | `data/work/<id>/motion/input.mp4` (la vidéo suivie par body3d) |
+| `masks` | `data/work/<id>/motion/masks.npz` (même source ; cadence de `camera.json`) |
 | `ref` | `data/work/<id>/identity/ref.png` |
 | `ref_mask` (option) | `data/work/<id>/identity/ref_mask.png` : blanc = personne |
 
