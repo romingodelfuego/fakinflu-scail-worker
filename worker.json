@@ -27,5 +27,5 @@
     "notes": "Serverless (catalogue RunPod 2026-10-09) : AMPERE_48 1,22 $/h (A6000/A40), ADA_48_PRO 1,75 $/h (L40S/6000 Ada) -> pire cas 1,75 $/h. Image : fp16 (32,8 Go) + int8 (16,7 Go) + ~10 Go d'encodeurs. COMFY_EXTRA_ARGS : options ComfyUI sans rebuild (README, arbre de decision ; make animate-probe pour mesurer). Point ouvert 4 : si l'int8 tient sur 24 Go, passer a AMPERE_24 (0,69 $/h).",
     "price_per_h": 1.75
   },
-  "version": "v1.0.4"
+  "version": "v1.0.5"
 }
