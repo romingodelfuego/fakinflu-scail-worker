@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fakinflu — worker scail : animation SCAIL-2 (Wan 2.1 14B via ComfyUI). Plan motion, Phase 2.
+"""fakinflu — worker scail : character replacement SCAIL-2 (Wan 2.1 14B via ComfyUI).
 
 Remplace le /handler.py de runpod/worker-comfyui ; /start.sh lance ComfyUI (127.0.0.1:8188).
 Handler GENERATEUR : progression morceau par morceau et apercu via /stream (return_aggregate_stream = False).
@@ -7,16 +7,18 @@ Meme squelette que body3d/serverless/handler.py (aide ComfyUI recopiee : chaque 
 
 Entree (contrat transfer.py) :
   {"run_id", "r2": bool,
-   "inputs":  {"control": video de controle body3d (control_pose.mp4),
-               "masks":   masks.npz de body3d (meme run que control),
+   "inputs":  {"source":  video source (celle que body3d a suivie : motion/input.mp4),
+               "masks":   masks.npz de body3d (meme source ; cadence = params.preset.masks_fps),
                "ref":     image d'identite (PNG/JPEG),
                "ref_mask": option, image noir et blanc (blanc = personne)},
-   "outputs": {"video": {put_url, key, max_bytes} | {max_bytes}},
+   "outputs": {"video": {put_url, key, max_bytes} | {max_bytes},
+               "sheet": idem, option : planche « vu par le modele » (inputs_sheet.png)},
    "outputs_json": {put_url, key} | null,
    "params":  {"preset": {...preset d'animation resolu (app/src/schemas AnimatePreset)...},
                "prompt": str, "negative": str}}
 
-La video de controle arrive du PC (decision 7 du plan) : le worker ne refait ni le rendu ni le suivi.
+Comme le blueprint officiel, pose_video = la video source brute (SCAIL-2 n'attend pas de carte de pose).
+Le worker ne refait pas le suivi : le masque vient de masks.npz.
 """
 import glob, json, os, queue, re, shutil, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
 
@@ -327,26 +329,27 @@ def handler(job):
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return
+    outputs, sheet_sent = None, False
     try:
         outputs = Outputs(inp)
         paths, events = fetch_inputs(inp, os.path.join(work, "in"), outputs)
         yield from events
-        missing = [r for r in ("control", "masks", "ref") if r not in paths]
+        missing = [r for r in ("source", "masks", "ref") if r not in paths]
         if missing:
             raise ValueError(f"entrees manquantes : {missing}")
         if not prompt:
             raise ValueError("prompt vide : SCAIL-2 a besoin de la description de la DA")
-        meta = ffprobe(paths["control"])
+        meta = ffprobe(paths["source"])
         summary = plan(preset, meta)
         mem_info = check_memory(summary)
         print(f"[scail] {mem_info} ; COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '')!r}", flush=True)
         yield {"type": "progress", "step": mem_info, "pct": 1}
         yield {"type": "progress", "pct": 2,
-               "step": f"controle {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
+               "step": f"source {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
                        f"{summary['width']}x{summary['height']} a {summary['fps']:g} fps, "
                        f"{summary['segments']} morceau(x), {summary['frames_out']} images"}
 
-        files = {"control": paths["control"], "masks": paths["masks"], "ref": _to_input(paths["ref"], tag)}
+        files = {"source": paths["source"], "masks": paths["masks"], "ref": _to_input(paths["ref"], tag)}
         if "ref_mask" in paths:
             files["ref_mask"] = _to_input(paths["ref_mask"], tag)
         copied = [os.path.join(COMFY_DIR, "input", files[k]) for k in ("ref", "ref_mask") if k in files]
@@ -358,6 +361,9 @@ def handler(job):
         seconds = yield from global_progress_wrap(run_workflow(wf))
 
         produced = collect(prefix)
+        if "sheet" in produced and "sheet" in outputs.specs:
+            yield from outputs.emit("sheet", produced["sheet"], OUTPUT_NAMES["sheet"])
+            sheet_sent = True
         if "video" not in produced:
             raise RuntimeError(f"aucune video produite (fichiers : {sorted(produced)})")
         yield preview_event(thumb(produced["video"]), "image/jpeg")
@@ -368,6 +374,12 @@ def handler(job):
                            "segments": summary["segments"], "frames_out": summary["frames_out"]}}
     except Exception as e:
         traceback.print_exc()
+        sheet = collect(prefix).get("sheet")  # la planche aide surtout quand le job echoue
+        if sheet and outputs and "sheet" in outputs.specs and not sheet_sent:
+            try:
+                yield from outputs.emit("sheet", sheet, OUTPUT_NAMES["sheet"])
+            except Exception:
+                traceback.print_exc()
         yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
     finally:
         shutil.rmtree(work, ignore_errors=True)

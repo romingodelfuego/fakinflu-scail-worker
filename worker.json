@@ -2,7 +2,7 @@
   "name": "scail",
   "repo": "romingodelfuego/fakinflu-scail-worker",
   "visibility": "private",
-  "description": "fakinflu RunPod serverless worker: SCAIL-2 character animation (Wan 2.1 14B, ComfyUI 0.34 native nodes, models baked). Inputs: control video and masks.npz from body3d, identity image, art-direction prompt. Output: animation.mp4.",
+  "description": "fakinflu RunPod serverless worker: SCAIL-2 character replacement (Wan 2.1 14B, ComfyUI 0.34 native nodes, models baked). Inputs: source video and masks.npz from body3d, identity image, prompt. Outputs: animation.mp4, inputs_sheet.png.",
   "license": "SCAIL-2 weights (Comfy-Org repackage): MIT; Wan 2.1 text encoder / CLIP vision: Apache-2.0; lightx2v distill LoRA: Apache-2.0 (upstream lightx2v) — review before commercial use",
   "endpoint": {
     "name": "fakinflu-scail-worker",
@@ -27,5 +27,5 @@
     "notes": "Serverless (catalogue RunPod 2026-10-09) : AMPERE_48 1,22 $/h (A6000/A40), ADA_48_PRO 1,75 $/h (L40S/6000 Ada) -> pire cas 1,75 $/h. Image : fp16 (32,8 Go) + int8 (16,7 Go) + ~10 Go d'encodeurs. COMFY_EXTRA_ARGS : options ComfyUI sans rebuild (README, arbre de decision ; make animate-probe pour mesurer). Point ouvert 4 : si l'int8 tient sur 24 Go, passer a AMPERE_24 (0,69 $/h).",
     "price_per_h": 1.75
   },
-  "version": "v1.0.5"
+  "version": "v1.1.0"
 }
