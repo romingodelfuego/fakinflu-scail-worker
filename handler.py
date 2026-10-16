@@ -50,7 +50,7 @@ def wait_comfy(max_s=600):
             return
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
             time.sleep(1)
-    raise RuntimeError(f"ComfyUI injoignable sur {COMFY} apres {max_s}s")
+    raise RuntimeError(f"ComfyUI unreachable at {COMFY} after {max_s}s")
 
 
 def _ws_progress(client_id, q, stop):
@@ -91,21 +91,21 @@ def run_workflow(wf):
         try:
             r = _http("POST", "/prompt", {"prompt": wf, "client_id": client_id})
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"ComfyUI a refuse le graphe (HTTP {e.code}) : {e.read().decode()[:1500]}")
+            raise RuntimeError(f"ComfyUI rejected the graph (HTTP {e.code}): {e.read().decode()[:1500]}")
         pid = r["prompt_id"]
         t0, last_poll = time.time(), 0.0
         names = {k: v.get("_meta", {}).get("title") or v["class_type"] for k, v in wf.items()}
         while True:
             if time.time() - t0 > JOB_TIMEOUT:
                 _http("POST", "/interrupt", {})
-                raise RuntimeError(f"timeout ComfyUI ({JOB_TIMEOUT}s)")
+                raise RuntimeError(f"ComfyUI timeout ({JOB_TIMEOUT}s)")
             try:
                 m = q.get(timeout=1)
                 d = m.get("data", {})
                 if m["type"] == "executing" and d.get("node"):
                     yield {"type": "progress", "step": names.get(d["node"], d["node"])}
                 elif m["type"] == "progress" and d.get("max"):
-                    yield {"type": "progress", "step": names.get(d.get("node"), "calcul"),
+                    yield {"type": "progress", "step": names.get(d.get("node"), "compute"),
                            "pct": round(100 * d["value"] / d["max"]), "frame": d["value"]}
             except queue.Empty:
                 pass
@@ -118,7 +118,7 @@ def run_workflow(wf):
                 raise
             except urllib.error.URLError as e:
                 # processus ComfyUI tue (le plus souvent : limite memoire du conteneur atteinte)
-                raise RuntimeError(f"ComfyUI s'est arrete en cours de calcul ({e.reason}) : {oom_report()}") from e
+                raise RuntimeError(f"ComfyUI stopped mid-compute ({e.reason}): {oom_report()}") from e
             if pid not in h:
                 continue
             st = h[pid].get("status") or {}
@@ -127,7 +127,7 @@ def run_workflow(wf):
                 detail = msgs[-1][1] if msgs else st
                 if isinstance(detail, dict):
                     detail = {k: detail.get(k) for k in ("node_id", "node_type", "exception_message")}
-                raise RuntimeError(f"erreur d'execution ComfyUI : {json.dumps(detail, ensure_ascii=False)[:800]}")
+                raise RuntimeError(f"ComfyUI execution error: {json.dumps(detail, ensure_ascii=False)[:800]}")
             if st.get("completed"):
                 return time.time() - t0
     finally:
@@ -193,13 +193,13 @@ def oom_report():
     kills = next((int(l.split()[1]) for l in events.splitlines() if l.startswith("oom_kill ")), None)
     peak = _cgroup("memory.peak") or _cgroup("memory.max_usage_in_bytes")
     limit = memory_limit_bytes()
-    gb = lambda b: f"{int(b) / 1024 ** 3:.1f} Go"
-    mem = f"pic {gb(peak.strip())}" if peak and peak.strip().isdigit() else "pic inconnu"
-    mem += f", limite {gb(limit)}" if limit else ", limite inconnue"
+    gb = lambda b: f"{int(b) / 1024 ** 3:.1f} GB"
+    mem = f"peak {gb(peak.strip())}" if peak and peak.strip().isdigit() else "peak unknown"
+    mem += f", limit {gb(limit)}" if limit else ", limit unknown"
     if kills:
-        return (f"tue par le noyau faute de memoire (oom_kill={kills}, {mem}). Verifier COMFY_EXTRA_ARGS "
-                f"(actuel : {os.environ.get('COMFY_EXTRA_ARGS', '')!r}), sinon preset int8 ou resolution plus basse")
-    return f"aucun oom_kill dans le cgroup ({mem}) : plantage natif probable (journaux RunPod du worker)"
+        return (f"killed by the kernel out of memory (oom_kill={kills}, {mem}). Check COMFY_EXTRA_ARGS "
+                f"(current: {os.environ.get('COMFY_EXTRA_ARGS', '')!r}), otherwise int8 preset or lower resolution")
+    return f"no oom_kill in the cgroup ({mem}): likely native crash (worker RunPod logs)"
 
 
 def _gb(b):
@@ -252,8 +252,8 @@ def check_vram(preset):
         return None
     vram = max((d.get("vram_total") or 0 for d in devices), default=0) / 1024 ** 3
     if preset.get("precision", "fp16") == "fp16" and 0 < vram < FP16_MIN_VRAM_GB:
-        raise ValueError(f"precision fp16 sur {vram:.0f} Go de VRAM : il en faut {FP16_MIN_VRAM_GB:g} ; utiliser le preset int8")
-    return f"VRAM {vram:.0f} Go, precision {preset.get('precision', 'fp16')}"
+        raise ValueError(f"fp16 precision on {vram:.0f} GB of VRAM: needs {FP16_MIN_VRAM_GB:g}; use the int8 preset")
+    return f"VRAM {vram:.0f} GB, precision {preset.get('precision', 'fp16')}"
 
 
 def check_memory(summary):
@@ -261,10 +261,10 @@ def check_memory(summary):
     need = ram_bytes(summary)
     limit = memory_limit_bytes()
     budget = IMAGES_RAM_SHARE * limit if limit else IMAGES_RAM_FALLBACK_GB * 1024 ** 3
-    gb = lambda b: f"{b / 1024 ** 3:.1f} Go"
-    info = f"images en RAM {gb(need)}, limite conteneur {gb(limit) if limit else 'inconnue'}, budget {gb(budget)}"
+    gb = lambda b: f"{b / 1024 ** 3:.1f} GB"
+    info = f"images in RAM {gb(need)}, container limit {gb(limit) if limit else 'unknown'}, budget {gb(budget)}"
     if need > budget:
-        raise ValueError(f"animation trop lourde pour le worker ({info}) : baisser resolution ou fps du preset")
+        raise ValueError(f"animation too heavy for the worker ({info}): lower the preset resolution or fps")
     return info
 
 
@@ -315,7 +315,7 @@ def handler(job):
             outputs = Outputs(inp)
             wait_comfy(120)
             report = probe_report()
-            print(f"[scail] sonde : {json.dumps(report)}", flush=True)
+            print(f"[scail] probe: {json.dumps(report)}", flush=True)
             path = os.path.join(work, "probe.json")
             with open(path, "w") as f:
                 json.dump(report, f, indent=2)
@@ -333,18 +333,18 @@ def handler(job):
         yield from events
         missing = [r for r in ("control", "masks", "ref") if r not in paths]
         if missing:
-            raise ValueError(f"entrees manquantes : {missing}")
+            raise ValueError(f"missing inputs: {missing}")
         if not prompt:
-            raise ValueError("prompt vide : SCAIL-2 a besoin de la description de la DA")
+            raise ValueError("empty prompt: SCAIL-2 needs the art-direction description")
         meta = ffprobe(paths["control"])
         summary = plan(preset, meta)
         mem_info = check_memory(summary)
         print(f"[scail] {mem_info} ; COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '')!r}", flush=True)
         yield {"type": "progress", "step": mem_info, "pct": 1}
         yield {"type": "progress", "pct": 2,
-               "step": f"controle {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
-                       f"{summary['width']}x{summary['height']} a {summary['fps']:g} fps, "
-                       f"{summary['segments']} morceau(x), {summary['frames_out']} images"}
+               "step": f"control {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} frames -> "
+                       f"{summary['width']}x{summary['height']} at {summary['fps']:g} fps, "
+                       f"{summary['segments']} segment(s), {summary['frames_out']} frames"}
 
         files = {"control": paths["control"], "masks": paths["masks"], "ref": _to_input(paths["ref"], tag)}
         if "ref_mask" in paths:
@@ -359,7 +359,7 @@ def handler(job):
 
         produced = collect(prefix)
         if "video" not in produced:
-            raise RuntimeError(f"aucune video produite (fichiers : {sorted(produced)})")
+            raise RuntimeError(f"no video produced (files: {sorted(produced)})")
         yield preview_event(thumb(produced["video"]), "image/jpeg")
         yield from outputs.emit("video", produced["video"], OUTPUT_NAMES["video"])
         outputs.write_summary()
